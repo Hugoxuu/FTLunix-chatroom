@@ -1,9 +1,17 @@
+/* 
+ * 18749 Team Project Server version 4 by Team 7
+ * Team member: Lue Li, Yan Pan, Yunmeng Xie, Zeyuan Xu
+ * Final Demo: Fault-tolerant Chat Room
+ * Date: 12/15/2018
+ */
+
 #include <stdio.h> 
 #include <stdlib.h>
-#include <sys/types.h> //数据类型定义
+#include <sys/types.h>
 #include <sys/stat.h>
-#include <netinet/in.h> //定义数据结构sockaddr_in
-#include <sys/socket.h> //提供socket函数及数据结构
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
@@ -11,11 +19,27 @@
 #include <errno.h>
 #include <sys/shm.h>
 #include <time.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <getopt.h>
 #define PERM S_IRUSR|S_IWUSR 
-#define MYPORT 3490 //宏定义定义通信端口
-#define BACKLOG 10 //宏定义，定义服务程序可以连接的最大客户数量
-#define WELCOME "|----------Welcome to the chat room! ----------|" //宏定义，当客户端连接服务端时，想客户发送此欢迎字符串
-//转换函数，将int类型转换成char *类型
+#define MYPORT 3490
+#define BACKLOG 10
+#define MAXHOST 32//maximum host name characters
+#define BUFSIZE 1024
+#define WELCOME "|----------Welcome to the chat room! ----------|"
+
+const char *pathName = "record.txt";
+// checkpoint sent flag
+volatile sig_atomic_t ck_ready = 0;
+/* SIGALRM signal handler */
+/* SIGALRM signal handler, set hb_ready when alarmed */
+void sigalrm_handler(){
+//    alarm(heartbeat_itv);
+    ck_ready = 1;
+    return;
+}
+
 void itoa(int i,char*string)
 {
 	int power,j;
@@ -30,7 +54,7 @@ void itoa(int i,char*string)
 	*string='\0';
 }
 
-//得到当前系统时间
+// Get current system time
 void get_cur_time(char * time_str)
 {
 	time_t timep;
@@ -54,11 +78,11 @@ void get_cur_time(char * time_str)
 	strcat(time_str,")");
 	free(time_tmp);
 }
-//创建共享存储区，进程间通讯
+
 key_t shm_create()
 {
 	key_t shmid;
-//shmid = shmget(IPC_PRIVATE,1024,PERM);
+
 	if((shmid = shmget(IPC_PRIVATE,1024,PERM)) == -1)
 	{
 		fprintf(stderr,"Create Share Memory Error:%s\n\a",strerror(errno));
@@ -66,22 +90,22 @@ key_t shm_create()
 	}
 	return shmid;
 }
-//端口绑定函数,创建套接字，并绑定到指定端口
+
 int bindPort(unsigned short int port)
 { 
 	int sockfd;
 	struct sockaddr_in my_addr;
-	sockfd = socket(AF_INET,SOCK_STREAM,0);//创建基于流套接字
-	my_addr.sin_family = AF_INET;//IPv4协议族
-	my_addr.sin_port = htons(port);//端口转换
+	sockfd = socket(AF_INET,SOCK_STREAM,0);
+	my_addr.sin_family = AF_INET;
+	my_addr.sin_port = htons(port);
 	my_addr.sin_addr.s_addr = INADDR_ANY;
-	bzero(&(my_addr.sin_zero),0);//置空
+	bzero(&(my_addr.sin_zero),0);
 	int on = 1;
 	if(setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(int)) < 0) {
 		perror("setsockopt");
 		exit(1);
 	}
-	if(bind(sockfd,(struct sockaddr*)&my_addr,sizeof(struct sockaddr)) == -1)//绑定本地IP
+	if(bind(sockfd,(struct sockaddr*)&my_addr,sizeof(struct sockaddr)) == -1)
 	{
 		perror("bind");
 		exit(1);
@@ -93,47 +117,130 @@ int bindPort(unsigned short int port)
 
 int main(int argc, char *argv[])
 {
-	int sockfd,clientfd,sin_size,recvbytes; //定义监听套接字、客户套接字
-	pid_t pid,ppid; //定义父子线程标记变量
-	char *buf, *r_addr, *w_addr, *temp, *time_str;//="\0"; //定义临时存储区
-	struct sockaddr_in their_addr; //定义地址结构
+	int sockfd,clientfd,sin_size,recvbytes; 
+	pid_t pid,ppid,pidd;
+	char *buf, *r_addr, *w_addr, *temp, *time_str;
+	struct sockaddr_in their_addr;
 	key_t shmid;
+	int checkpoint_freq = 60;
+	int backup = 0;
+	char backup_host[MAXHOST]="192.168.0.0";
+	char opt;
+	while((opt = getopt(argc,argv,"hB:f:"))!= -1){
+        switch(opt){
+            case 'h':
+            	printf("\t-h\t\tprint this message\n");
+                printf("\t-B <host>\tassign backup server host.Default none.\n");
+                printf("\t-f <frequency>\tconfig checkpointing interval(60 secs by defalut)\n");
+                return 0;
+            case 'B':
+                backup = 1;
+                strncpy(backup_host,optarg,MAXHOST);
+                break;
+            case 'f':
+                // max hb 5 mins
+                checkpoint_freq = atoi(optarg) > 300 ? 300 :atoi(optarg);
+                break;
+            default:
+                printf("check %s -h for help\n",argv[0]);
+                return 0;
 
-	shmid = shm_create(); //创建共享存储区
+        }
+    }
+	shmid = shm_create();
 
 	temp = (char *)malloc(255);
 	time_str=(char *)malloc(20);
-	sockfd = bindPort(MYPORT);//绑定端口
-	while(1)
-	{ 
-		if(listen(sockfd,BACKLOG) == -1)//在指定端口上监听
+	sockfd = bindPort(MYPORT);
+	int out = open(pathName, O_RDWR | O_CREAT, S_IRWXU); //open record file
+	char *start = "Records:\n";
+	write(out, start, strlen(start));
+	pidd = fork();
+	if (pidd == 0){
+		int fd;
+		char *ck_buf;
+		int port = 3491;
+		int sendbytes;
+		struct hostent *host;
+		struct sockaddr_in clientaddr;
+		if(signal(SIGALRM,sigalrm_handler) == SIG_ERR){
+            perror("checkpoint initialization");
+            exit(1);
+        }
+        host = gethostbyname(backup_host);
+		if((fd = socket(AF_INET,SOCK_STREAM,0)) == -1){
+				perror("socket\n");
+				exit(1);
+		}
+
+		clientaddr.sin_family = AF_INET;
+		clientaddr.sin_port = htons((uint16_t)port);
+		clientaddr.sin_addr = *((struct in_addr *)host->h_addr);
+		bzero(&(clientaddr.sin_zero),0);
+		printf("Connectting...\n");
+		if(connect(fd,(struct sockaddr *)&clientaddr,sizeof(struct sockaddr)) == -1){
+			perror("connect");
+			exit(1);
+		}
+		if((ck_buf = (char *)malloc(BUFSIZE * sizeof(char))) == NULL){
+			perror("malloc");
+			exit(1);
+		}
+
+		ck_ready = 0;
+		alarm(checkpoint_freq);
+		while(1) {
+		if (ck_ready == 1) {
+			ck_ready = 0;
+			alarm(checkpoint_freq);
+			printf("Sending checkpoint...\n");
+			char linebuf[1024];
+			FILE *fp = fopen(pathName, "r");
+			memset(ck_buf,0,BUFSIZE);
+			while(fgets(linebuf, 1024, (FILE *)fp)) {
+				strcat(ck_buf, linebuf);
+			}
+			if((sendbytes = send(fd,ck_buf,strlen(ck_buf),0)) == -1){
+            perror("send\n");
+            //break;
+           	}
+			printf("%s\n", ck_buf);
+			fclose(fp);
+			
+			}
+			
+		}
+		free(ck_buf);
+
+		}
+		else if (pidd > 0) {
+		while(1)
+		{ 		
+		if(listen(sockfd,BACKLOG) == -1)
 		{
 			perror("listen");
 			exit(1);
 		}
 		printf("listening......\n");
-		if((clientfd = accept(sockfd,(struct sockaddr*)&their_addr,&sin_size)) == -1)//接收客户端连接
+		if((clientfd = accept(sockfd,(struct sockaddr*)&their_addr,&sin_size)) == -1)
 		{
 			perror("accept");
 			exit(1);
 		}
-		printf("accept from:%d\n",inet_ntoa(their_addr.sin_addr));
-		send(clientfd,WELCOME,strlen(WELCOME),0);//发送问候信息
+		printf("accept from:%s\n",inet_ntoa(their_addr.sin_addr));
+		send(clientfd,WELCOME,strlen(WELCOME),0);
 		buf = (char *)malloc(255);
 
-		ppid = fork();//创建子进程
+		ppid = fork();
 		if(ppid == 0)
 		{
-		//printf("ppid=0\n");
-			pid = fork(); //创建子进程 
+			pid = fork();
 			while(1)
 			{
 				if(pid > 0)
 				{
-				//父进程用于接收信息
 					memset(buf,0,255);
-				//printf("recv\n");
-				//sleep(1);
+
 					if((recvbytes = recv(clientfd,buf,255,0)) <= 0)
 					{
 						perror("recv1");
@@ -141,44 +248,37 @@ int main(int argc, char *argv[])
 						raise(SIGKILL);
 						exit(1);
 					}
-				//write buf's data to share memory
+					//write buf's data to share memory
 					w_addr = shmat(shmid, 0, 0);
 					memset(w_addr, '\0', 1024);
 					strncpy(w_addr, buf, 1024);
 					get_cur_time(time_str);
 					strcat(buf,time_str);
 					printf(" %s\n",buf);
+					if (strcmp(w_addr, "Are you alive?") != 0) {
+						strcat(buf, "\n");
+						write(out, buf, strlen(buf)); //write records into file
+					}
 
 				}
 				else if(pid == 0)
 				{
-				//子进程用于发送信息
-				//scanf("%s",buf);
 					sleep(1);
 					r_addr = shmat(shmid, 0, 0);
-				//printf("---%s\n",r_addr);
-				//printf("cmp:%d\n",strcmp(temp,r_addr));
+
 					if(strcmp(temp,r_addr) != 0)
 					{
-						//char *mess = strchr(r_addr, ':');
 						
-						if (strcmp(r_addr, "Are you alive?") == 0) {
-							//printf("%s\n", r_addr);
-							//strcpy(temp, "I am alive!");
+						if (strcmp(r_addr, "Are you alive?") == 0) 
+						{
 							strcpy(r_addr, "I am alive!");
-
-							strcpy(temp,r_addr);
 						}
 						else {
-								
-								//printf("common message\n");
 								get_cur_time(time_str); 
 								strcat(r_addr,time_str);	
 							}
-						strcpy(temp,r_addr);
 						printf("%s\n", r_addr);
-					//printf("discriptor:%d\n",clientfd);
-					//if(send(clientfd,buf,strlen(buf),0) == -1)
+
 						if(send(clientfd,r_addr,strlen(r_addr),0) == -1)
 						{
 							perror("send");
@@ -186,11 +286,14 @@ int main(int argc, char *argv[])
 						memset(r_addr, '\0', 1024);
 						strcpy(r_addr,temp);
 					}
+					
+					//used to send checkpoint
 				}
 				else
 				perror("fork");
 			}
 		}
+	}
 	}
 	printf("------------------------------\n");
 	free(buf);
@@ -198,6 +301,7 @@ int main(int argc, char *argv[])
 	free(time_str);
 	close(sockfd);
 	close(clientfd);
+	close(out);
 	return 0;
 }
 
